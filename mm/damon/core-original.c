@@ -22,11 +22,6 @@
 #define DAMON_MIN_REGION 1
 #endif
 
-#include <linux/pagewalk.h>
-
-// For profiling application's IPC/CPI
-#include <linux/perf_event.h>
-
 static DEFINE_MUTEX(damon_lock);
 static int nr_running_ctxs;
 static bool running_exclusive_ctxs;
@@ -35,9 +30,6 @@ static DEFINE_MUTEX(damon_ops_lock);
 static struct damon_operations damon_registered_ops[NR_DAMON_OPS];
 
 static struct kmem_cache *damon_region_cache __ro_after_init;
-
-//	extern struct perf_event *event_cycles1, *event_instrs1;
-//	extern struct perf_event *event_cycles2, *event_instrs2;
 
 /* Should be called under damon_ops_lock with id smaller than NR_DAMON_OPS */
 static bool __damon_is_registered_ops(enum damon_ops_id id)
@@ -120,39 +112,6 @@ int damon_select_ops(struct damon_ctx *ctx, enum damon_ops_id id)
 	return err;
 }
 
-
-// Check and update the number of thps
-// within the range [start, end) using mm_walk (ZS)
-static int count_thp_pmd(pmd_t *pmd, unsigned long addr,
-		unsigned long next, struct mm_walk *walk) {
-	
-	unsigned long *thp_count = walk->private;
-
-	if (pmd_trans_huge(*pmd)) {
-		// PMD is huge, increase counter
-		*(thp_count) += 1;
-	}
-
-	return 0;
-
-}
-
-static const struct mm_walk_ops count_thp_ops = {
-	.pmd_entry = count_thp_pmd,
-};
-
-static unsigned long count_region_thps(struct mm_struct *mm,
-		unsigned long start, unsigned long end) {
-
-	unsigned thp_count = 0UL;
-	
-	mmap_read_lock(mm);	
-	walk_page_range(mm, start, end, &count_thp_ops, &thp_count);
-	mmap_read_unlock(mm);
-	
-	return thp_count;
-}
-
 /*
  * Construct a damon_region struct
  *
@@ -173,11 +132,6 @@ struct damon_region *damon_new_region(unsigned long start, unsigned long end)
 
 	region->age = 0;
 	region->last_nr_accesses = 0;
-
-	// Also initilize nr_thps and tlbh_freq_hot
-	// For use with DAMOS_TLBH (ZS)
-	region->nr_thps = 0;
-	region->tlbh_freq_hot = 0;
 
 	return region;
 }
@@ -203,36 +157,6 @@ void damon_destroy_region(struct damon_region *r, struct damon_target *t)
 {
 	damon_del_region(r, t);
 	damon_free_region(r);
-}
-
-// Port damon_get_task_struct() and damon_get_mm here (ZS)
-static inline struct task_struct *damon_get_task_struct(struct damon_target *t)
-{
-	return get_pid_task(t->pid, PIDTYPE_PID);
-}
-
-static struct mm_struct *damon_get_mm(struct damon_target *t)
-{
-	struct task_struct *task;
-	struct mm_struct *mm;
-
-	task = damon_get_task_struct(t);
-	if (!task)
-		return NULL;
-
-	mm = get_task_mm(task);
-	put_task_struct(task);
-	return mm;
-}
-
-void damon_update_region_thp(struct damon_region *r, struct damon_target *t) {
-
-	struct mm_struct *mm = damon_get_mm(t);
-	if (!mm)
-		return;
-	r->nr_thps = count_region_thps(mm, r->ar.start, r->ar.end);
-	mmput(mm);
-
 }
 
 /*
@@ -264,8 +188,6 @@ static int damon_fill_regions_holes(struct damon_region *first,
 			newr = damon_new_region(r->ar.end, next->ar.start);
 			if (!newr)
 				return -ENOMEM;
-			// Update the # of thps in this region (ZS)
-			damon_update_region_thp(newr, t);
 			damon_insert_region(newr, r, next, t);
 		}
 	}
@@ -325,8 +247,6 @@ int damon_set_regions(struct damon_target *t, struct damon_addr_range *ranges,
 					ALIGN(range->end, DAMON_MIN_REGION));
 			if (!newr)
 				return -ENOMEM;
-			// Update the # of thps in this region (ZS)
-			damon_update_region_thp(newr, t);
 			damon_insert_region(newr, damon_prev_region(r), r, t);
 		} else {
 			/* resize intersecting regions to fit in this range */
@@ -408,8 +328,6 @@ struct damon_target *damon_new_target(void)
 {
 	struct damon_target *t;
 
-	int i;
-
 	t = kmalloc(sizeof(*t), GFP_KERNEL);
 	if (!t)
 		return NULL;
@@ -418,35 +336,6 @@ struct damon_target *damon_new_target(void)
 	t->nr_regions = 0;
 	INIT_LIST_HEAD(&t->regions_list);
 	INIT_LIST_HEAD(&t->list);
-	// Initialize the intention promote queue (ZS)
-	INIT_LIST_HEAD(&t->intention_promote);	
-	t->nr_intention_promote_regions = 0;
-	t->cumulated_2MB_regions = 0UL;
-	t->cumulated_trail_2MB_regions = 0UL;
-
-	t->allow_intention_insert = true;
-	t->in_first_profiling = false;
-	t->finish_first_profiling = false;
-	t->in_second_profiling = false;
-
-	for (i = 0; i < MAX_PROFILE_THREAD; ++i) {
-
-		t->profile[i] = NULL;
-
-		t->event_cycles1[i] = NULL;
-		t->event_instrs1[i] = NULL;
-
-		t->event_cycles2[i] = NULL;
-		t->event_instrs2[i] = NULL;
-
-		t->event_cycles3[i] = NULL;
-		t->event_instrs3[i] = NULL;
-
-		t->event_cycles4[i] = NULL;
-		t->event_instrs4[i] = NULL;
-	}
-
-	t->nr_profile_thread = 0;
 
 	return t;
 }
@@ -493,6 +382,8 @@ struct damon_ctx *damon_new_ctx(void)
 	ctx = kzalloc(sizeof(*ctx), GFP_KERNEL);
 	if (!ctx)
 		return NULL;
+
+	init_completion(&ctx->kdamond_started);
 
 	ctx->attrs.sample_interval = 5 * 1000;
 	ctx->attrs.aggr_interval = 100 * 1000;
@@ -630,11 +521,14 @@ static int __damon_start(struct damon_ctx *ctx)
 	mutex_lock(&ctx->kdamond_lock);
 	if (!ctx->kdamond) {
 		err = 0;
+		reinit_completion(&ctx->kdamond_started);
 		ctx->kdamond = kthread_run(kdamond_fn, ctx, "kdamond.%d",
 				nr_running_ctxs);
 		if (IS_ERR(ctx->kdamond)) {
 			err = PTR_ERR(ctx->kdamond);
 			ctx->kdamond = NULL;
+		} else {
+			wait_for_completion(&ctx->kdamond_started);
 		}
 	}
 	mutex_unlock(&ctx->kdamond_lock);
@@ -805,163 +699,6 @@ static bool damos_valid_target(struct damon_ctx *c, struct damon_target *t,
 	return c->ops.get_scheme_score(c, t, r, s) >= s->quota.min_score;
 }
 
-/*
- * damos_skip_charged_region() - Check if the given region or starting part of
- * it is already charged for the DAMOS quota.
- * @t:	The target of the region.
- * @rp:	The pointer to the region.
- * @s:	The scheme to be applied.
- *
- * If a quota of a scheme has exceeded in a quota charge window, the scheme's
- * action would applied to only a part of the target access pattern fulfilling
- * regions.  To avoid applying the scheme action to only already applied
- * regions, DAMON skips applying the scheme action to the regions that charged
- * in the previous charge window.
- *
- * This function checks if a given region should be skipped or not for the
- * reason.  If only the starting part of the region has previously charged,
- * this function splits the region into two so that the second one covers the
- * area that not charged in the previous charge widnow and saves the second
- * region in *rp and returns false, so that the caller can apply DAMON action
- * to the second one.
- *
- * Return: true if the region should be entirely skipped, false otherwise.
- */
-static bool damos_skip_charged_region(struct damon_target *t,
-		struct damon_region **rp, struct damos *s)
-{
-	struct damon_region *r = *rp;
-	struct damos_quota *quota = &s->quota;
-	unsigned long sz_to_skip;
-
-	/* Skip previously charged regions */
-	if (quota->charge_target_from) {
-		if (t != quota->charge_target_from)
-			return true;
-		if (r == damon_last_region(t)) {
-			quota->charge_target_from = NULL;
-			quota->charge_addr_from = 0;
-			return true;
-		}
-		if (quota->charge_addr_from &&
-				r->ar.end <= quota->charge_addr_from)
-			return true;
-
-		if (quota->charge_addr_from && r->ar.start <
-				quota->charge_addr_from) {
-			sz_to_skip = ALIGN_DOWN(quota->charge_addr_from -
-					r->ar.start, DAMON_MIN_REGION);
-			if (!sz_to_skip) {
-				if (damon_sz_region(r) <= DAMON_MIN_REGION)
-					return true;
-				sz_to_skip = DAMON_MIN_REGION;
-			}
-			damon_split_region_at(t, r, sz_to_skip);
-			r = damon_next_region(r);
-			*rp = r;
-		}
-		quota->charge_target_from = NULL;
-		quota->charge_addr_from = 0;
-	}
-	return false;
-}
-
-static void damos_update_stat(struct damos *s,
-		unsigned long sz_tried, unsigned long sz_applied)
-{
-	s->stat.nr_tried++;
-	s->stat.sz_tried += sz_tried;
-	if (sz_applied)
-		s->stat.nr_applied++;
-	s->stat.sz_applied += sz_applied;
-}
-
-static void damos_apply_scheme(struct damon_ctx *c, struct damon_target *t,
-		struct damon_region *r, struct damos *s)
-{
-	struct damos_quota *quota = &s->quota;
-	//	unsigned long sz = damon_sz_region(r);
-	unsigned long sz = 0;
-	struct timespec64 begin, end;
-	unsigned long sz_applied = 0;
-	int err = 0;
-
-	// Switch to  damon_tlbh_effective_sz_region
-	// if action of the scheme is DAMOS_TLBH (ZS)
-	if (s->action == DAMOS_TLBH || s->action == DAMOS_GEMINI
-			|| s->action == DAMOS_TLBH_OVH) {
-		sz = damon_tlbh_effective_sz_region(r);
-	} else {
-		sz = damon_sz_region(r);
-	}
-
-	if (c->ops.apply_scheme) {
-		// For DAMOS_TLBH: Do not promote
-		// the region if it shows 0 nr_accesses
-		// (ZS)
-		if (s->action == DAMOS_TLBH &&
-			(r->nr_accesses <= 0 ||
-			c->ops.get_scheme_score(c, t, r, s) < s->quota.min_score)) {
-
-			sz = 0;
-			goto update_stat;
-		}
-
-		if (quota->esz && quota->charged_sz + sz > quota->esz) {
-			// For DAMOS_TLBH: align down to granularity of 4MB (ZS)
-			if (s->action == DAMOS_TLBH
-					|| s->action == DAMOS_GEMINI) {
-				damos_update_stat(s, sz, sz_applied);
-
-			} else {
-				sz = ALIGN_DOWN(quota->esz - quota->charged_sz,
-						DAMON_MIN_REGION);
-				if (!sz)
-					goto update_stat;
-				damon_split_region_at(t, r, sz);
-			}
-		}
-
-		ktime_get_coarse_ts64(&begin);
-		if (c->callback.before_damos_apply)
-			err = c->callback.before_damos_apply(c, t, r, s);
-		if (!err) {
-			if (s->action == DAMOS_TLBH ||
-				s->action == DAMOS_GEMINI) {
-				t->is_promote = true;
-			}
-			sz_applied = c->ops.apply_scheme(c, t, r, s);
-		}
-		ktime_get_coarse_ts64(&end);
-		quota->total_charged_ns += timespec64_to_ns(&end) -
-			timespec64_to_ns(&begin);
-		// For DAMOS_TLBH: Do not change charged_sz as it will be handled
-		// in do_hugepage_reallocate (ZS) 
-		if (s->action != DAMOS_TLBH && s->action != DAMOS_GEMINI) {
-			quota->charged_sz += sz;
-		}
-
-		if (quota->esz && quota->charged_sz >= quota->esz) {
-			quota->charge_target_from = t;
-			quota->charge_addr_from = r->ar.end + 1;
-		}
-	}
-	if (s->action != DAMOS_STAT)
-		r->age = 0;
-
-update_stat:
-	// For DAMO_TLBH: if estimated quota is depleted,
-	// apply demotion to the region.
-	//	if ( (!sz) && (s->action == DAMOS_TLBH) ) {
-	//		t->is_promote = false;
-	//		sz_applied = c->ops.apply_scheme(c, t, r, s);
-	//		sz_applied = 0;
-	//	}
-
-	damos_update_stat(s, sz, sz_applied);
-}
-
-
 static void damon_do_apply_schemes(struct damon_ctx *c,
 				   struct damon_target *t,
 				   struct damon_region *r)
@@ -970,38 +707,81 @@ static void damon_do_apply_schemes(struct damon_ctx *c,
 
 	damon_for_each_scheme(s, c) {
 		struct damos_quota *quota = &s->quota;
+		unsigned long sz = damon_sz_region(r);
+		struct timespec64 begin, end;
+		unsigned long sz_applied = 0;
 
 		if (!s->wmarks.activated)
 			continue;
 
 		/* Check the quota */
-		if ( s->action != DAMOS_TLBH ) {
-			if (quota->esz && quota->charged_sz >= quota->esz)
+		if (quota->esz && quota->charged_sz >= quota->esz)
+			continue;
+
+		/* Skip previously charged regions */
+		if (quota->charge_target_from) {
+			if (t != quota->charge_target_from)
 				continue;
-		}
-
-		// if (damos_skip_charged_region(t, &r, s))
-		// Do not skip charged region
-		// when DAMOS_TLBH is in use (ZS)
-		if ( (s->action != DAMOS_TLBH)
-				&& damos_skip_charged_region(t, &r, s))
-			continue;
-
-		if (!damos_valid_target(c, t, r, s)) {
-			// For DAMO_TLBH: if a damon region is not valid,
-			// apply demotion to the region. (ZS)
-			if ( s->action == DAMOS_TLBH ) {
-				//	// Do not directly call c->ops.apply_scheme here,
-				//	// call damos_apply_scheme so that the region can
-				//	// be splitted. (ZS)
-				//	damos_apply_scheme(c, t, r, s);
-				t->is_promote = false;
-				c->ops.apply_scheme(c, t, r, s);
+			if (r == damon_last_region(t)) {
+				quota->charge_target_from = NULL;
+				quota->charge_addr_from = 0;
+				continue;
 			}
-			continue;
+			if (quota->charge_addr_from &&
+					r->ar.end <= quota->charge_addr_from)
+				continue;
+
+			if (quota->charge_addr_from && r->ar.start <
+					quota->charge_addr_from) {
+				sz = ALIGN_DOWN(quota->charge_addr_from -
+						r->ar.start, DAMON_MIN_REGION);
+				if (!sz) {
+					if (damon_sz_region(r) <=
+					    DAMON_MIN_REGION)
+						continue;
+					sz = DAMON_MIN_REGION;
+				}
+				damon_split_region_at(t, r, sz);
+				r = damon_next_region(r);
+				sz = damon_sz_region(r);
+			}
+			quota->charge_target_from = NULL;
+			quota->charge_addr_from = 0;
 		}
 
-		damos_apply_scheme(c, t, r, s);
+		if (!damos_valid_target(c, t, r, s))
+			continue;
+
+		/* Apply the scheme */
+		if (c->ops.apply_scheme) {
+			if (quota->esz &&
+					quota->charged_sz + sz > quota->esz) {
+				sz = ALIGN_DOWN(quota->esz - quota->charged_sz,
+						DAMON_MIN_REGION);
+				if (!sz)
+					goto update_stat;
+				damon_split_region_at(t, r, sz);
+			}
+			ktime_get_coarse_ts64(&begin);
+			sz_applied = c->ops.apply_scheme(c, t, r, s);
+			ktime_get_coarse_ts64(&end);
+			quota->total_charged_ns += timespec64_to_ns(&end) -
+				timespec64_to_ns(&begin);
+			quota->charged_sz += sz;
+			if (quota->esz && quota->charged_sz >= quota->esz) {
+				quota->charge_target_from = t;
+				quota->charge_addr_from = r->ar.end + 1;
+			}
+		}
+		if (s->action != DAMOS_STAT)
+			r->age = 0;
+
+update_stat:
+		s->stat.nr_tried++;
+		s->stat.sz_tried += sz;
+		if (sz_applied)
+			s->stat.nr_applied++;
+		s->stat.sz_applied += sz_applied;
 	}
 }
 
@@ -1028,63 +808,6 @@ static void damos_set_effective_quota(struct damos_quota *quota)
 	quota->esz = esz;
 }
 
-static void damos_adjust_quota(struct damon_ctx *c, struct damos *s)
-{
-	struct damos_quota *quota = &s->quota;
-	struct damon_target *t;
-	struct damon_region *r;
-	unsigned long cumulated_sz;
-	unsigned int score, max_score = 0;
-
-	if (!quota->ms && !quota->sz)
-		return;
-
-	/* New charge window starts */
-	if (time_after_eq(jiffies, quota->charged_from +
-				msecs_to_jiffies(quota->reset_interval))) {
-		if (quota->esz && quota->charged_sz >= quota->esz)
-			s->stat.qt_exceeds++;
-		quota->total_charged_sz += quota->charged_sz;
-		quota->charged_from = jiffies;
-		// For DAMOS_TLBH: Do not clear charged_sz (ZS)
-		// quota->charged_sz = 0;
-		damos_set_effective_quota(quota);
-	}
-
-	if (!c->ops.get_scheme_score)
-		return;
-
-	/* Fill up the score histogram */
-	memset(quota->histogram, 0, sizeof(quota->histogram));
-	damon_for_each_target(t, c) {
-		damon_for_each_region(r, t) {
-			if (!__damos_valid_target(r, s))
-				continue;
-			score = c->ops.get_scheme_score(c, t, r, s);
-			// Switch to  damon_tlbh_effective_sz_region
-			// if action of the scheme is DAMOS_TLBH (ZS)
-			if (s->action == DAMOS_TLBH || s->action == DAMOS_GEMINI
-				|| s->action == DAMOS_TLBH_OVH)
-				quota->histogram[score] += damon_tlbh_effective_sz_region(r);
-			else
-				quota->histogram[score] += damon_sz_region(r);
-			if (score > max_score)
-				max_score = score;
-		}
-	}
-
-	/* Set the min score limit */
-	for (cumulated_sz = 0, score = max_score; ; score--) {
-		cumulated_sz += quota->histogram[score];
-		if (cumulated_sz >= quota->esz || !score)
-			break;
-	}
-	quota->min_score = score;
-
-	//	pr_warn("damos_adjust_quota: cumulated_sz: %lu, esz: %lu, charged_sz: %lu, min_score: %u, max_score: %u\n",
-	//		cumulated_sz, quota->esz, quota->charged_sz, quota->min_score, max_score);
-}
-
 static void kdamond_apply_schemes(struct damon_ctx *c)
 {
 	struct damon_target *t;
@@ -1092,16 +815,57 @@ static void kdamond_apply_schemes(struct damon_ctx *c)
 	struct damos *s;
 
 	damon_for_each_scheme(s, c) {
+		struct damos_quota *quota = &s->quota;
+		unsigned long cumulated_sz;
+		unsigned int score, max_score = 0;
+
 		if (!s->wmarks.activated)
 			continue;
 
-		damos_adjust_quota(c, s);
+		if (!quota->ms && !quota->sz)
+			continue;
+
+		/* New charge window starts */
+		if (time_after_eq(jiffies, quota->charged_from +
+					msecs_to_jiffies(
+						quota->reset_interval))) {
+			if (quota->esz && quota->charged_sz >= quota->esz)
+				s->stat.qt_exceeds++;
+			quota->total_charged_sz += quota->charged_sz;
+			quota->charged_from = jiffies;
+			quota->charged_sz = 0;
+			damos_set_effective_quota(quota);
+		}
+
+		if (!c->ops.get_scheme_score)
+			continue;
+
+		/* Fill up the score histogram */
+		memset(quota->histogram, 0, sizeof(quota->histogram));
+		damon_for_each_target(t, c) {
+			damon_for_each_region(r, t) {
+				if (!__damos_valid_target(r, s))
+					continue;
+				score = c->ops.get_scheme_score(
+						c, t, r, s);
+				quota->histogram[score] += damon_sz_region(r);
+				if (score > max_score)
+					max_score = score;
+			}
+		}
+
+		/* Set the min score limit */
+		for (cumulated_sz = 0, score = max_score; ; score--) {
+			cumulated_sz += quota->histogram[score];
+			if (cumulated_sz >= quota->esz || !score)
+				break;
+		}
+		quota->min_score = score;
 	}
 
 	damon_for_each_target(t, c) {
-		damon_for_each_region_safe(r, next_r, t) {
+		damon_for_each_region_safe(r, next_r, t)
 			damon_do_apply_schemes(c, t, r);
-		}
 	}
 }
 
@@ -1112,14 +876,6 @@ static void damon_merge_two_regions(struct damon_target *t,
 		struct damon_region *l, struct damon_region *r)
 {
 	unsigned long sz_l = damon_sz_region(l), sz_r = damon_sz_region(r);
-
-	// For DAMOS_TLBH: do not combine a region containing THP
-	// with another region without (ZS)
-	if ( (l->nr_thps > 0 && r->nr_thps <= 0) ||
-		(l->nr_thps <= 0 && r->nr_thps > 0) )
-		return;
-
-	l->nr_thps += r->nr_thps;
 
 	l->nr_accesses = (l->nr_accesses * sz_l + r->nr_accesses * sz_r) /
 			(sz_l + sz_r);
@@ -1186,26 +942,11 @@ static void damon_split_region_at(struct damon_target *t,
 {
 	struct damon_region *new;
 
-	//	// Calculate the amount of thps for the region to split (ZS)
-	//	unsigned long aligned_left_sz = ALIGN_DOWN(r->ar.start + sz_r, HPAGE_PMD_SIZE)
-	//					- ALIGN(r->ar.start, HPAGE_PMD_SIZE);
-
-	//	unsigned long left_nr_thps = r->nr_thps > 0 ?
-	//					(aligned_left_sz / HPAGE_PMD_SIZE) : 0;
-	//	unsigned long right_nr_thps = r->nr_thps > left_nr_thps ?
-	//					r->nr_thps - left_nr_thps : 0;
-
 	new = damon_new_region(r->ar.start + sz_r, r->ar.end);
 	if (!new)
 		return;
-	// Update the # of thps in this region (ZS)
-	damon_update_region_thp(new, t);
 
 	r->ar.end = new->ar.start;
-
-	// Update the nr_thps info (ZS)
-	r->nr_thps -= new->nr_thps;
-	// new->nr_thps = right_nr_thps;
 
 	new->age = r->age;
 	new->last_nr_accesses = r->last_nr_accesses;
@@ -1214,59 +955,30 @@ static void damon_split_region_at(struct damon_target *t,
 }
 
 /* Split every region in the given target into 'nr_subs' regions */
-static void damon_split_regions_of(struct damon_ctx *c, struct damon_target *t, int nr_subs)
+static void damon_split_regions_of(struct damon_target *t, int nr_subs)
 {
 	struct damon_region *r, *next;
 	unsigned long sz_region, sz_sub = 0;
 	int i;
 
-	struct damos *s;
-	unsigned long tlbh_quota_sz = 0;
-
-	damon_for_each_scheme(s, c) {
-		if (s->action == DAMOS_TLBH || s->action == DAMOS_GEMINI
-			|| s->action == DAMOS_TLBH_OVH) {
-			tlbh_quota_sz = (s->quota).sz;
-		}
-	}
-
 	damon_for_each_region_safe(r, next, t) {
 		sz_region = damon_sz_region(r);
 
-		// Disable random size selection (ZS)
-		//	for (i = 0; i < nr_subs - 1 &&
-		//			sz_region > 2 * DAMON_MIN_REGION; i++) {
-				/*
-				 * Randomly select size of left sub-region to be at
-				 * least 10 percent and at most 90% of original region
-				 */
-		//		sz_sub = ALIGN_DOWN(damon_rand(1, 10) *
-		//				sz_region / 10, DAMON_MIN_REGION);
-				/* Do not allow blank region */
-		//		if (sz_sub == 0 || sz_sub >= sz_region)
-		//			continue;
+		for (i = 0; i < nr_subs - 1 &&
+				sz_region > 2 * DAMON_MIN_REGION; i++) {
+			/*
+			 * Randomly select size of left sub-region to be at
+			 * least 10 percent and at most 90% of original region
+			 */
+			sz_sub = ALIGN_DOWN(damon_rand(1, 10) *
+					sz_region / 10, DAMON_MIN_REGION);
+			/* Do not allow blank region */
+			if (sz_sub == 0 || sz_sub >= sz_region)
+				continue;
 
-		//		damon_split_region_at(t, r, sz_sub);
-		//		sz_region = sz_sub;
-		//	}
-
-		// Only split when size of the region is greater than quota_sz / 2 (ZS)
-		if (tlbh_quota_sz > 0 &&
-				damon_tlbh_effective_sz_region(r) > tlbh_quota_sz / 2) {
-			// Raise the granularity to 4MB (ZS)
-			for (i = 0; i < nr_subs - 1 &&
-					sz_region >= 2 * HPAGE_PMD_SIZE + DAMON_MIN_REGION; i++) {
-
-				sz_sub = ALIGN(sz_region / 2, 2 * HPAGE_PMD_SIZE);
-				/* Do not allow blank region */
-				if (sz_sub == 0 || sz_sub >= sz_region)
-					continue;
-				damon_split_region_at(t, r, sz_sub);
-				sz_region = sz_sub;
-
-			}
+			damon_split_region_at(t, r, sz_sub);
+			sz_region = sz_sub;
 		}
-
 	}
 }
 
@@ -1293,14 +1005,13 @@ static void kdamond_split_regions(struct damon_ctx *ctx)
 	if (nr_regions > ctx->attrs.max_nr_regions / 2)
 		return;
 
-	// Disable splitting in to 3 regions (ZS)
-		/* Maybe the middle of the region has different access frequency */
-	//	if (last_nr_regions == nr_regions &&
-	//			nr_regions < ctx->attrs.max_nr_regions / 3)
-	//		nr_subregions = 3;
+	/* Maybe the middle of the region has different access frequency */
+	if (last_nr_regions == nr_regions &&
+			nr_regions < ctx->attrs.max_nr_regions / 3)
+		nr_subregions = 3;
 
 	damon_for_each_target(t, ctx)
-		damon_split_regions_of(ctx, t, nr_subregions);
+		damon_split_regions_of(t, nr_subregions);
 
 	last_nr_regions = nr_regions;
 }
@@ -1428,21 +1139,6 @@ static int kdamond_wait_activation(struct damon_ctx *ctx)
 	return -EBUSY;
 }
 
-static inline void damon_put_task_structs(struct damon_target *t) {
-
-        int i;
-
-        if (t->profile[0]) {
-                put_task_struct(t->profile[0]);
-        }
-
-        for (i = 0; i < MAX_PROFILE_THREAD; ++i)
-                t->profile[i] = NULL;
-
-        t->nr_profile_thread = 0;
-
-}
-
 /*
  * The monitoring daemon that runs as a kernel thread
  */
@@ -1454,20 +1150,9 @@ static int kdamond_fn(void *data)
 	unsigned int max_nr_accesses = 0;
 	unsigned long sz_limit = 0;
 
-	struct damos *s;
-
-	bool damos_tlbh = false;
-
 	pr_debug("kdamond (%d) starts\n", current->pid);
 
-	// Debug passing correct quota->sz info (ZS)
-	damon_for_each_scheme(s, ctx) {
-
-		if (s->action == DAMOS_TLBH || s->action == DAMOS_GEMINI
-			|| s->action == DAMOS_TLBH_OVH) {
-			damos_tlbh = true;
-		}
-	}
+	complete(&ctx->kdamond_started);
 
 	if (ctx->ops.init)
 		ctx->ops.init(ctx);
@@ -1492,20 +1177,17 @@ static int kdamond_fn(void *data)
 			max_nr_accesses = ctx->ops.check_accesses(ctx);
 
 		if (kdamond_aggregate_interval_passed(ctx)) {
-			if (!damos_tlbh) {
-				kdamond_merge_regions(ctx,
-						max_nr_accesses / 10,
-						sz_limit);
-			}
+			kdamond_merge_regions(ctx,
+					max_nr_accesses / 10,
+					sz_limit);
 			if (ctx->callback.after_aggregation &&
 					ctx->callback.after_aggregation(ctx))
 				break;
 			kdamond_apply_schemes(ctx);
 			kdamond_reset_aggregated(ctx);
 			kdamond_split_regions(ctx);
-			if (ctx->ops.reset_aggregated) {
+			if (ctx->ops.reset_aggregated)
 				ctx->ops.reset_aggregated(ctx);
-			}
 		}
 
 		if (kdamond_need_update_operations(ctx)) {

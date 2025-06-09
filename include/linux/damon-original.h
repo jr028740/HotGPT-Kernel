@@ -8,36 +8,21 @@
 #ifndef _DAMON_H_
 #define _DAMON_H_
 
+#include <linux/completion.h>
 #include <linux/mutex.h>
 #include <linux/time64.h>
 #include <linux/types.h>
 #include <linux/random.h>
-
-// For profiling application's IPC/CPI
-#include <linux/perf_event.h>
 
 /* Minimal region size.  Every damon_region is aligned by this. */
 #define DAMON_MIN_REGION	PAGE_SIZE
 /* Max priority score for DAMON-based operation schemes */
 #define DAMOS_MAX_SCORE		(99)
 
-// ivshmem part (ZS)
-#include <linux/io.h>
-#define TLBH_IVSHMEM_ADDR	0xe8000000
-#define SHM_SIZE	(128 << 20)
-// First half for demote, second half for promote
-#define MAX_ELEM_AMOUNT	((SHM_SIZE / sizeof(unsigned long) - 2) >> 2)
-#define DEMOTE_START	2
-#define PROMOTE_START	(2 + MAX_ELEM_AMOUNT - 1)
-// Maximum number of a region to be set hot before trying to promote
-#define MAX_TLBH_HOT_FREQ	8
-// Maximum number of threads to profile
-#define MAX_PROFILE_THREAD	10
-
 /* Get a random number in [l, r) */
 static inline unsigned long damon_rand(unsigned long l, unsigned long r)
 {
-	return l + get_random_u32_below(r - l);
+	return l + prandom_u32_max(r - l);
 }
 
 /**
@@ -72,15 +57,6 @@ struct damon_region {
 	unsigned int age;
 /* private: Internal value for age calculation. */
 	unsigned int last_nr_accesses;
-
-	// For DAMOS_TLBH use only
-	
-	// numbers of transparent huge pages (ZS)
-	unsigned long nr_thps;
-	// numbers of time region is marked hot (ZS)
-	unsigned int tlbh_freq_hot;
-	// list head for siblings in intention_promote (ZS)
-	struct list_head intention_promote_node;
 };
 
 /**
@@ -100,35 +76,6 @@ struct damon_target {
 	unsigned int nr_regions;
 	struct list_head regions_list;
 	struct list_head list;
-// For using DAMOS_TLBH only (ZS)
-	bool is_promote;
-// For use with alignment (ZS)
-	unsigned long *tlbh_ivshmem_base;
-// Implementation of Intention Promote Queue (ZS)
-	struct list_head intention_promote;
-	unsigned int nr_intention_promote_regions;
-	// Full number of 2MB regions for promotion
-	unsigned long cumulated_2MB_regions;
-	// 10% regions for trail promotion
-	unsigned long cumulated_trail_2MB_regions;
-// Control the insertion of intention_promote_node (ZS)
-	bool allow_intention_insert;
-// perf_event pointers (round 1 and round 2)
-	struct task_struct *profile[MAX_PROFILE_THREAD];
-	unsigned int nr_profile_thread;
-	struct perf_event *event_cycles1[MAX_PROFILE_THREAD];
-	struct perf_event *event_instrs1[MAX_PROFILE_THREAD];
-	struct perf_event *event_cycles2[MAX_PROFILE_THREAD];
-	struct perf_event *event_instrs2[MAX_PROFILE_THREAD];
-	struct perf_event *event_cycles3[MAX_PROFILE_THREAD];
-	struct perf_event *event_instrs3[MAX_PROFILE_THREAD];
-	struct perf_event *event_cycles4[MAX_PROFILE_THREAD];
-	struct perf_event *event_instrs4[MAX_PROFILE_THREAD];
-// Flag if in first round of profiling (with no promotion applied)
-	bool in_first_profiling;
-	bool finish_first_profiling;
-// Flag if in second round of profiling (with 10% promotion applied)
-	bool in_second_profiling;
 };
 
 /**
@@ -153,9 +100,6 @@ enum damos_action {
 	DAMOS_NOHUGEPAGE,
 	DAMOS_LRU_PRIO,
 	DAMOS_LRU_DEPRIO,
-	DAMOS_TLBH,		// Actions for TLBHottest (ZS)
-	DAMOS_GEMINI,		// Actions for Gemini (ZS)
-	DAMOS_TLBH_OVH,		// Actions for TLBHottest overhead test (ZS)
 	DAMOS_STAT,		/* Do nothing but only record the stat */
 	NR_DAMOS_ACTIONS,
 };
@@ -414,7 +358,6 @@ struct damon_operations {
  * @after_wmarks_check:	Called after each schemes' watermarks check.
  * @after_sampling:	Called after each sampling.
  * @after_aggregation:	Called after each aggregation.
- * @before_damos_apply:	Called before applying DAMOS action.
  * @before_terminate:	Called before terminating the monitoring.
  * @private:		User private data.
  *
@@ -443,10 +386,6 @@ struct damon_callback {
 	int (*after_wmarks_check)(struct damon_ctx *context);
 	int (*after_sampling)(struct damon_ctx *context);
 	int (*after_aggregation)(struct damon_ctx *context);
-	int (*before_damos_apply)(struct damon_ctx *context,
-			struct damon_target *target,
-			struct damon_region *region,
-			struct damos *scheme);
 	void (*before_terminate)(struct damon_ctx *context);
 };
 
@@ -514,6 +453,8 @@ struct damon_ctx {
 /* private: internal use only */
 	struct timespec64 last_aggregation;
 	struct timespec64 last_ops_update;
+	/* for waiting until the execution of the kdamond_fn is started */
+	struct completion kdamond_started;
 
 /* public: */
 	struct task_struct *kdamond;
@@ -551,18 +492,6 @@ static inline unsigned long damon_sz_region(struct damon_region *r)
 	return r->ar.end - r->ar.start;
 }
 
-static inline unsigned long damon_tlbh_effective_sz_region(struct damon_region *r)
-{
-
-	// Calculate the effective size of the region with start and end
-	// addresses aligned to 2MB
-	
-	unsigned long aligned_end = ALIGN_DOWN(r->ar.end, HPAGE_SIZE);
-	unsigned long aligned_start = ALIGN(r->ar.start, HPAGE_SIZE);
-
-	return aligned_end > aligned_start ? (aligned_end - aligned_start) : 0;
-}
-
 
 #define damon_for_each_region(r, t) \
 	list_for_each_entry(r, &t->regions_list, list)
@@ -585,13 +514,6 @@ static inline unsigned long damon_tlbh_effective_sz_region(struct damon_region *
 #define damon_for_each_scheme_safe(s, next, ctx) \
 	list_for_each_entry_safe(s, next, &(ctx)->schemes, list)
 
-// Iterate through intention_promote list (ZS)
-#define damon_tlbh_for_each_intention_promote_region(r, t) \
-	list_for_each_entry(r, &t->intention_promote, intention_promote_node)
-
-#define damon_tlbh_for_each_intention_promote_region_safe(r, next, t) \
-	list_for_each_entry_safe(r, next, &t->intention_promote, intention_promote_node)
-
 #ifdef CONFIG_DAMON
 
 struct damon_region *damon_new_region(unsigned long start, unsigned long end);
@@ -609,8 +531,6 @@ static inline void damon_insert_region(struct damon_region *r,
 
 void damon_add_region(struct damon_region *r, struct damon_target *t);
 void damon_destroy_region(struct damon_region *r, struct damon_target *t);
-// Update a damon region with number of thps (ZS)
-void damon_update_region_thp(struct damon_region *r, struct damon_target *t);
 int damon_set_regions(struct damon_target *t, struct damon_addr_range *ranges,
 		unsigned int nr_ranges);
 
@@ -640,6 +560,13 @@ int damon_select_ops(struct damon_ctx *ctx, enum damon_ops_id id);
 static inline bool damon_target_has_pid(const struct damon_ctx *ctx)
 {
 	return ctx->ops.id == DAMON_OPS_VADDR || ctx->ops.id == DAMON_OPS_FVADDR;
+}
+
+static inline unsigned int damon_max_nr_accesses(const struct damon_attrs *attrs)
+{
+	/* {aggr,sample}_interval are unsigned long, hence could overflow */
+	return min(attrs->aggr_interval / attrs->sample_interval,
+			(unsigned long)UINT_MAX);
 }
 
 
