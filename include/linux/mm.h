@@ -29,7 +29,6 @@
 #include <linux/pgtable.h>
 #include <linux/kasan.h>
 #include <linux/memremap.h>
-#include <linux/hugegpt.h>
 
 struct mempolicy;
 struct anon_vma;
@@ -1216,8 +1215,6 @@ static inline void put_page(struct page *page)
 	 * from 2 to 1:
 	 */
 	if (put_devmap_managed_page(&folio->page))
-		return;
-	if (hgpt_page_free(page))
 		return;
 	folio_put(folio);
 }
@@ -2412,7 +2409,6 @@ static inline void pgtable_init(void)
 {
 	ptlock_cache_init();
 	pgtable_cache_init();
-	hgpt_init();
 }
 
 static inline bool pgtable_pte_page_ctor(struct page *page)

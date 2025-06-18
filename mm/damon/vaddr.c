@@ -433,7 +433,7 @@ static int damon_mkold_pmd_entry(pmd_t *pmd, unsigned long addr,
 		}
 
 		if (pmd_trans_huge(*pmd)) {
-			damon_pmdp_mkold(pmd, walk->mm, addr);
+			damon_pmdp_mkold(pmd, walk->vma, addr);
 			spin_unlock(ptl);
 			return 0;
 		}
@@ -446,7 +446,7 @@ static int damon_mkold_pmd_entry(pmd_t *pmd, unsigned long addr,
 	if (!pmd_present(*pmd)) {
 		goto out;
 	}
-	damon_nonleaf_pmdp_mkold(pmd, walk->mm, addr);
+	damon_nonleaf_pmdp_mkold(pmd, walk->vma, addr);
 out:
 	spin_unlock(ptl);
 	return 0;
@@ -829,105 +829,187 @@ static void tlbh_write_gfns_range(struct mm_struct *mm,
 	
 }
 
-// Demote all THPs within the range [start, end) using mm_walk (ZS)
-static int tlbh_demote_huge_pmd(pmd_t *pmd, unsigned long addr,
-		unsigned long next, struct mm_walk *walk) {
+//	// Demote all THPs within the range [start, end) using mm_walk (ZS)
+//	static int tlbh_demote_huge_pmd(pmd_t *pmd, unsigned long addr,
+//			unsigned long next, struct mm_walk *walk) {
+//		
+//		struct page *page = NULL;
+//		unsigned long *err_cnt = walk->private;
+//	
+//		if (pmd_trans_huge(*pmd)) {
+//			pmd_t demote_pmd;
+//			spinlock_t *ptl = pmd_trans_huge_lock(pmd, walk->vma);
+//			if (!ptl) {
+//				++err_cnt;
+//				return 0;
+//			}
+//	
+//			demote_pmd = *pmd;
+//	
+//			if (unlikely(!pmd_present(demote_pmd))) {
+//				VM_BUG_ON(thp_migration_supported() &&
+//						!is_pmd_migration_entry(demote_pmd));
+//				goto err_pmd_unlock;
+//			}
+//	
+//			page = pmd_page(demote_pmd);
+//	
+//			// Do not demote non-anonymous huge pages
+//			if (!PageAnon(page)) {
+//				goto err_pmd_unlock;
+//			}
+//	
+//			get_page(page);
+//			spin_unlock(ptl);
+//			lock_page(page);
+//			if (unlikely(split_huge_page(page))) {
+//				++err_cnt;
+//			}
+//			unlock_page(page);
+//			put_page(page);
+//			return 0;
+//	
+//	err_pmd_unlock:
+//			spin_unlock(ptl);
+//			++err_cnt;
+//		}
+//	
+//		return 0;
+//	}
+//	
+//	static const struct mm_walk_ops tlbh_demote_region_ops = {
+//		.pmd_entry = tlbh_demote_huge_pmd,
+//	};
+//	
+//	static unsigned long damo_tlbh_demote_memory_region(struct mm_struct *mm,
+//			unsigned long start, unsigned long end)
+//	{
+//		unsigned long err_cnt = 0;
+//	
+//		mmap_read_lock(mm);	
+//		walk_page_range(mm, start, end, &tlbh_demote_region_ops, &err_cnt);
+//		mmap_read_unlock(mm);
+//	
+//		return err_cnt;
+//	}
+
+//	static uintptr_t find_page_table_page(struct mm_struct *mm, unsigned long vaddr) {
+//		//	pgd_t *pgd = pgd_offset(mm, vaddr);
+//		struct page *pte_page = NULL;
+//		pte_t *pte = NULL;
+//	
+//		//	if (pgd_none(*pgd) || pgd_bad(*pgd))
+//		//		return;
+//		//	
+//		//	pud_t *pud = pud_offset(pgd, vaddr);
+//		//	if (pud_none(*pud) || pud_bad(*pud))
+//		//		return;
+//		
+//		//	pmd_t *pmd = pmd_offset(pud, vaddr);
+//		pmd_t *pmd = pmd_off(mm, vaddr);
+//		if (pmd_none(*pmd) || pmd_bad(*pmd))
+//			return 0;
+//		
+//		if (pmd_huge(*pmd)) {
+//		    // It's a huge page, mapped at PMD level
+//		    //	pr_warn("Mapped at PMD level: PMD phys page = %llx\n",
+//		    //	       (unsigned long long)pmd_pfn(*pmd) << PAGE_SHIFT);
+//		    return (uintptr_t) pfn_to_page(pmd_pfn(*pmd));
+//		}
+//		
+//		pte = pte_offset_kernel(pmd, vaddr);
+//		if (pte_none(*pte))
+//			return 0;
+//		
+//		pte_page = virt_to_page(pte);
+//		//	pr_warn("PTE page: %p\n", pte_page);
+//		return (uintptr_t) pte_page;
+//	}
+
+#ifdef CONFIG_X86
+#include <asm/pgalloc.h>
+
+//	static inline void paravirt_alloc_pte(struct mm_struct *mm, unsigned long pfn) {
+//		PVOP_VCALL2((paravirt_ops.mmu).alloc_pte, mm, pfn);
+//	}
+//	
+//	static inline void pmd_populate_kernel(struct mm_struct *mm,
+//					       pmd_t *pmd, pte_t *pte) {
+//		paravirt_alloc_pte(mm, __pa(pte) >> PAGE_SHIFT);
+//		set_pmd(pmd, __pmd(__pa(pte) | _PAGE_TABLE));
+//	}
+
+static int collapse_pte_pages(struct mm_struct *mm, unsigned long start_addr) {
+	struct page *huge_page;
+	pmd_t *pmd;
+	pgtable_t new_pt;
+	int i;
+	unsigned long addr = start_addr;
 	
-	struct page *page = NULL;
-	unsigned long *err_cnt = walk->private;
+	// Allocate a 2MB hugepage for merging
+	huge_page = alloc_pages(GFP_KERNEL | __GFP_COMP, get_order(PMD_SIZE));
+	if (!huge_page)
+		return -ENOMEM;
+	
+	// Lock page table
+	down_write(&mm->mmap_lock);
+	
+	for (i = 0; i < 512; i++, addr += PAGE_SIZE) {
+		struct vm_area_struct *flush_vma = find_vma(mm, addr);
 
-	if (pmd_trans_huge(*pmd)) {
-		pmd_t demote_pmd;
-		spinlock_t *ptl = pmd_trans_huge_lock(pmd, walk->vma);
-		if (!ptl) {
-			++err_cnt;
-			return 0;
+		pmd = pmd_offset(pud_offset(p4d_offset(pgd_offset(mm, addr), addr), addr), addr);
+		
+		if (pmd_none(*pmd) || !pmd_present(*pmd)) {
+			// skip invalid entries
+			continue;
 		}
-
-		demote_pmd = *pmd;
-
-		if (unlikely(!pmd_present(demote_pmd))) {
-			VM_BUG_ON(thp_migration_supported() &&
-					!is_pmd_migration_entry(demote_pmd));
-			goto err_pmd_unlock;
-		}
-
-		page = pmd_page(demote_pmd);
-
-		// Do not demote non-anonymous huge pages
-		if (!PageAnon(page)) {
-			goto err_pmd_unlock;
-		}
-
-		get_page(page);
-		spin_unlock(ptl);
-		lock_page(page);
-		if (unlikely(split_huge_page(page))) {
-			++err_cnt;
-		}
-		unlock_page(page);
-		put_page(page);
-		return 0;
-
-err_pmd_unlock:
-		spin_unlock(ptl);
-		++err_cnt;
+		
+		pte_t *old_pte;
+		old_pte = pte_offset_kernel(pmd, addr);
+		
+		// Offset into huge page
+		void *dst = page_address(huge_page) + (i * PAGE_SIZE);
+		void *src = (void *)old_pte;
+		
+		// Copy page table content
+		memcpy(dst, src, PAGE_SIZE);
+		
+		// Replace PTE page pointer with new one
+		new_pt = virt_to_page(dst); // convert back to struct page*
+		pmd_populate_kernel(mm, pmd, (pte_t *)dst);
+		
+		// Flush TLB to avoid stale entries
+		if (flush_vma)
+			flush_tlb_page(flush_vma, addr);
 	}
-
+	
+	up_write(&mm->mmap_lock);
 	return 0;
 }
 
-static const struct mm_walk_ops tlbh_demote_region_ops = {
-	.pmd_entry = tlbh_demote_huge_pmd,
-};
+#else
 
-static unsigned long damo_tlbh_demote_memory_region(struct mm_struct *mm,
-		unsigned long start, unsigned long end)
-{
-	unsigned long err_cnt = 0;
+static inline int collapse_pte_pages(struct mm_struct *mm, unsigned long start_addr) {}
 
-	mmap_read_lock(mm);	
-	walk_page_range(mm, start, end, &tlbh_demote_region_ops, &err_cnt);
-	mmap_read_unlock(mm);
-
-	return err_cnt;
-}
-
-static void find_page_table_page(struct mm_struct *mm, unsigned long vaddr) {
-	pgd_t *pgd = pgd_offset(mm, vaddr);
-	if (pgd_none(*pgd) || pgd_bad(*pgd))
-		return;
-	
-	pud_t *pud = pud_offset(pgd, vaddr);
-	if (pud_none(*pud) || pud_bad(*pud))
-		return;
-	
-	pmd_t *pmd = pmd_offset(pud, vaddr);
-	if (pmd_none(*pmd) || pmd_bad(*pmd))
-		return;
-	
-	if (pmd_huge(*pmd)) {
-	    // It's a huge page, mapped at PMD level
-	    printk("Mapped at PMD level: PMD phys page = %llx\n",
-	           (unsigned long long)pmd_pfn(*pmd) << PAGE_SHIFT);
-	    return;
-	}
-	
-	pte_t *pte = pte_offset_kernel(pmd, vaddr);
-	if (pte_none(*pte)) return;
-	
-	struct page *pte_page = virt_to_page(pte);
-	printk("PTE page: %p\n", pte_page);
-}
+#endif
 
 // Print page table page address of a range [start,end) (ZS)
-static void hotgpt_print_pgtable_addr(struct mm_struct *mm,
+static void hotgpt_promote_pgtable_page(struct mm_struct *mm,
 		unsigned long start, unsigned long end)
 {
 	unsigned long i;
+	//	uintptr_t prev_addr = 0;
+	//	uintptr_t now_addr = 0;
 
-	for (i = start; i < end; i += PAGE_SHIFT) {
-		find_page_table_page(mm, i);	
+	for (i = start; i < end; i += HPAGE_PMD_SHIFT) {
+		//	now_addr = find_page_table_page(mm, i);
+		//	if (prev_addr != now_addr && now_addr != 0) {
+		//		// do_madvise();	
+		//		prev_addr = now_addr;
+		//		pr_warn("PTE page: %lx\n", now_addr);
+		//	}
+		collapse_pte_pages(mm, i);	
+
 	}
 
 }
@@ -1308,7 +1390,7 @@ static void do_hugepage_reallocate(struct damon_ctx *ctx, struct damon_target *t
 				// Get the page table address of the region (ZS)
 
 				//	do_madvise(mm, pmd_aligned_start, pmd_aligned_len, MADV_COLLAPSE);
-				hotgpt_print_pgtable_addr(mm, pmd_aligned_start, pmd_aligned_start + pmd_aligned_len);
+				hotgpt_promote_pgtable_page(mm, pmd_aligned_start, pmd_aligned_start + pmd_aligned_len);
 				// Write the gfns to shared memory (promote)
 				if (t->tlbh_ivshmem_base) {
 					tlbh_write_gfns_range(mm, pmd_aligned_start,
@@ -1342,7 +1424,7 @@ static void do_hugepage_reallocate(struct damon_ctx *ctx, struct damon_target *t
 
 	if (t->tlbh_ivshmem_base) {
                 memunmap(t->tlbh_ivshmem_base);
-                kvm_hypercall1(KVM_HC_TLBH_HOST_ALIGN, 1);
+                //	kvm_hypercall1(KVM_HC_TLBH_HOST_ALIGN, 1);
         }
 
 	//	pr_warn("reallocated charged_sz: %lu\n", quota->charged_sz);

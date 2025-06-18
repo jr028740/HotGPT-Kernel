@@ -81,6 +81,19 @@ void damon_pmdp_mkold(pmd_t *pmd, struct vm_area_struct *vma, unsigned long addr
 #endif /* CONFIG_TRANSPARENT_HUGEPAGE */
 }
 
+void damon_nonleaf_pmdp_mkold(pmd_t *pmd, struct vm_area_struct *vma, unsigned long addr)
+{
+	if (pmd_young(*pmd)) {
+		test_and_clear_bit(_PAGE_BIT_ACCESSED,
+				(unsigned long *)pmd);
+	}
+
+#ifdef CONFIG_MMU_NOTIFIER
+	mmu_notifier_clear_young(vma->vm_mm, addr, addr + HPAGE_PMD_SIZE);
+#endif /* CONFIG_MMU_NOTIFIER */
+
+}
+
 #define DAMON_MAX_SUBSCORE	(100)
 #define DAMON_MAX_AGE_IN_LOG	(32)
 
@@ -132,4 +145,53 @@ int damon_cold_score(struct damon_ctx *c, struct damon_region *r,
 
 	/* Return coldness of the region */
 	return DAMOS_MAX_SCORE - hotness;
+}
+
+int damon_tlbh_score(struct damon_ctx *c, struct damon_region *r,
+			struct damos *s)
+{
+	unsigned int max_nr_accesses = 0;
+	int hotness;
+
+	if (c->ops.check_accesses)
+		max_nr_accesses = c->ops.check_accesses(c);
+
+	if (max_nr_accesses == 0)
+		return 0;
+
+	hotness = r->nr_accesses * DAMON_MAX_SUBSCORE / max_nr_accesses;
+
+	return hotness * DAMOS_MAX_SCORE / DAMON_MAX_SUBSCORE;
+
+}
+
+int damon_tlbh_cold_score(struct damon_ctx *c, struct damon_region *r,
+			struct damos *s)
+{
+
+	int hotness = damon_tlbh_score(c, r, s);
+	return DAMOS_MAX_SCORE - hotness;
+}
+
+static inline int damon_gemini_rand(void)
+
+{
+	static unsigned int seed = 1234;
+	
+	// Use linear-feedback shift register
+	// to generate reproducible pseudo-random
+	// numbers
+
+	seed ^= seed >> 11;
+	seed ^= seed << 21;
+	seed ^= seed >> 31;
+
+	return (int) (seed % (1 + DAMOS_MAX_SCORE));
+}
+
+int damon_gemini_score(struct damon_ctx *c, struct damon_region *r,
+			struct damos *s)
+{
+	return damon_gemini_rand();
+
 }

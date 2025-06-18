@@ -59,12 +59,6 @@
 #include <linux/entry-kvm.h>
 #include <linux/suspend.h>
 
-#include <linux/mm.h>
-#include <linux/hugegpt.h>
-#include <linux/pagewalk.h>
-#include <linux/list.h>
-#include <linux/huge_mm.h>
-
 #include <trace/events/kvm.h>
 
 #include <asm/debugreg.h>
@@ -9723,169 +9717,6 @@ static int complete_hypercall_exit(struct kvm_vcpu *vcpu)
 	return kvm_skip_emulated_instruction(vcpu);
 }
 
-/* HugeGPT Host KVM Support */
-struct hgpt_hc_ptscan_pmd_entry {
-	struct list_head head;
-	unsigned long addr;
-};
-
-struct hgpt_hc_ptscan_private {
-	struct list_head pmd_list;
-	unsigned long pmd_count;
-};
-
-static int hgpt_hc_ptscan_pmd(pmd_t *pmd, unsigned long addr, unsigned long next, struct mm_walk *walk) {
-	struct hgpt_hc_ptscan_private *private = walk->private;
-	struct hgpt_hc_ptscan_pmd_entry *list;
-
-	if (PageTransHuge(pmd_page(*pmd))) {
-		walk->action = ACTION_CONTINUE;
-	} else {
-		/* Found a PMD to gather */
-		list = kmalloc(sizeof(struct hgpt_hc_ptscan_pmd_entry), GFP_ATOMIC);
-		if (!list) {
-			pr_err("HugeGPT: hgpt_hc_ptscan_pmd: Found a PMD to gather but unable to do the bookkeeping: addr=%lx\n", addr);
-			return 0;
-		}
-		INIT_LIST_HEAD(&list->head);
-		list->addr = addr;
-		private->pmd_count = private->pmd_count + 1;
-		list_add_tail(&list->head, &private->pmd_list);
-	}
-	return 0;
-}
-
-static struct mm_walk_ops hgpt_hc_ptscan_ops = {
-	.pmd_entry = hgpt_hc_ptscan_pmd
-};
-
-static int hgpt_hc_handle_gather(struct kvm_vcpu *vcpu, unsigned long pfn, unsigned long len) {
-	struct kvm *kvm = vcpu->kvm;
-    struct mm_struct *mm = NULL;
-    unsigned long hva_start, hva_end;
-	struct hgpt_hc_ptscan_private private;
-	struct list_head *curr_head, *tmp;
-	struct hgpt_hc_ptscan_pmd_entry *list;
-	int walk_ret, collapse_ret;
-	struct vm_area_struct *vma, *prev;
-	struct vm_area_struct **prev_p = &prev;
-	LIST_HEAD(page_to_migrate);
-
-
-	pr_info("HugeGPT: hgpt_hc_handle_gather: Received hypercall, pfn=%lu, len=%lu\n", pfn, len);
-
-	if (!kvm) {
-		pr_err("HugeGPT: hgpt_hc_handle_gather: Got null kvm\n");
-		return -EINVAL;
-	}
-
-    mm = kvm->mm;
-    if (!mm) {
-		pr_err("HugeGPT: hgpt_hc_handle_gather: Got null mm\n");
-		return -EINVAL;
-	}
-
-    hva_start = kvm_vcpu_gfn_to_hva(vcpu, pfn);
-    hva_end = hva_start + PAGE_SIZE * len;
-	if (!hva_start || hva_end <= hva_start) {
-		pr_err("HugeGPT: hgpt_hc_handle_gather: HVA overflow, start %lx >= end %lx, or null start\n", hva_start, hva_end);
-		return -EINVAL;
-	}
-
-	/* Page walk */
-	INIT_LIST_HEAD(&private.pmd_list);
-	private.pmd_count = 0;
-	pr_info("HugeGPT: hgpt_hc_handle_gather: Starting the first page walk, hva_start=%lx, hva_end=%lx\n", hva_start, hva_end);
-	mmap_read_lock(mm);
-	walk_ret = walk_page_range(mm, hva_start, hva_end, &hgpt_hc_ptscan_ops, &private);
-	mmap_read_unlock(mm);
-	
-	if (walk_ret) {
-		pr_err("HugeGPT: hgpt_hc_handle_gather: Walk failed, ret=%d\n", walk_ret);
-		return -EINVAL;
-	}
-	if (!private.pmd_count) {
-		pr_info("HugeGPT: hgpt_hc_handle_gather: Nothing to gather\n");
-		return 0;
-	}
-	/* Gather */
-	pr_warn("HugeGPT: hgpt_hc_handle_gather: Got %lu PMDs to gather\n", private.pmd_count);
-	list_for_each_safe(curr_head, tmp, &private.pmd_list) {
-		list = list_entry(curr_head, struct hgpt_hc_ptscan_pmd_entry, head);
-		mmap_read_lock(mm);
-		vma = vma_lookup(mm, list->addr);
-		mmap_read_unlock(mm);
-		if (!vma) {
-			pr_err("HugeGPT: hgpt_hc_handle_gather: Got null vma\n");
-			goto skip;
-		}
-		prev = NULL;
-		mmap_read_lock(mm);
-		collapse_ret = madvise_collapse(vma, prev_p, list->addr, list->addr + PMD_SIZE);
-		mmap_read_unlock(mm);
-		if (collapse_ret) {
-			pr_err("HugeGPT: hgpt_hc_handle_gather: Collapse failed, addr=%lx, ret=%d\n", list->addr, collapse_ret);
-		}
-		skip:
-		list_del(curr_head);
-		kfree(list);
-	}
-
-	/* Another page walk */
-	private.pmd_count = 0;
-	mmap_read_lock(mm);
-	pr_info("HugeGPT: hgpt_hc_handle_gather: Starting the second page walk, hva_start=%lx, hva_end=%lx\n", hva_start, hva_end);
-	walk_ret = walk_page_range(mm, hva_start, hva_end, &hgpt_hc_ptscan_ops, &private);
-	mmap_read_unlock(mm);
-	if (walk_ret) {
-		pr_err("HugeGPT: hgpt_hc_handle_gather: Walk failed, ret=%d\n", walk_ret);
-		return -EINVAL;
-	}
-
-	/* Examine */
-	if (!private.pmd_count) {
-		pr_info("HugeGPT: hgpt_hc_handle_gather: All PMDs gathered successfully\n");
-		return 0;
-	}
-	list_for_each_safe(curr_head, tmp, &private.pmd_list) {
-		list = list_entry(curr_head, struct hgpt_hc_ptscan_pmd_entry, head);
-		pr_warn("HugeGPT: hgpt_hc_handle_gather: Got PMD left, addr=%lx\n", list->addr);
-		list_del(curr_head);
-		kfree(list);
-	}
-
-	return 0;
-}
-
-static int hgpt_hc_handle_map(struct kvm_vcpu *vcpu, unsigned long pfn, unsigned long len) {
-	struct kvm *kvm = vcpu->kvm;
-    struct mm_struct *mm = NULL;
-    unsigned long hva_start, hva_end;
-
-	pr_info("HugeGPT: hgpt_hc_handle_map: Received hypercall, pfn=%lu, len=%lu\n", pfn, len);
-
-	if (!kvm) {
-		pr_err("HugeGPT: hgpt_hc_handle_map: Got null kvm\n");
-		return -EINVAL;
-	}
-
-    mm = kvm->mm;
-    if (!mm) {
-		pr_err("HugeGPT: hgpt_hc_handle_map: Got null mm\n");
-		return -EINVAL;
-	}
-
-    hva_start = kvm_vcpu_gfn_to_hva(vcpu, pfn);
-    hva_end = hva_start + PAGE_SIZE * len;
-	if (!hva_start || hva_end <= hva_start) {
-		pr_err("HugeGPT: hgpt_hc_handle_map: HVA overflow, start %lx >= end %lx, or null start\n", hva_start, hva_end);
-		return -EINVAL;
-	}
-
-	pr_info("HugeGPT: hgpt_hc_handle_map: Calling do_madvise, addr=%lx, size=%lu\n", hva_start, PAGE_SIZE * len);
-    return do_madvise(mm, hva_start, PAGE_SIZE * len, MADV_HUGEPAGE);
-}
-
 int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
 {
 	unsigned long nr, a0, a1, a2, a3, ret;
@@ -9973,12 +9804,6 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
 		vcpu->arch.complete_userspace_io = complete_hypercall_exit;
 		return 0;
 	}
-	case KVM_HC_HGPT_REQ_MAP:
-		ret = hgpt_hc_handle_map(vcpu, a0, a1);
-		break;
-	case KVM_HC_HGPT_REQ_GATHER:
-		ret = hgpt_hc_handle_gather(vcpu, a0, a1);
-		break;
 	default:
 		ret = -KVM_ENOSYS;
 		break;

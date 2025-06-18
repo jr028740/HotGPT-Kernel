@@ -750,6 +750,10 @@ static const char * const damon_sysfs_damos_action_strs[] = {
 	"nohugepage",
 	"lru_prio",
 	"lru_deprio",
+	// HotGPT schemes (ZS)
+	"tlbh",
+	"gemini",
+	"tlbh_overhead",
 	"stat",
 };
 

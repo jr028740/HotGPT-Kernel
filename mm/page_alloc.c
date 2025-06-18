@@ -5632,10 +5632,6 @@ void __free_pages(struct page *page, unsigned int order)
 	/* get PageHead before we drop reference */
 	int head = PageHead(page);
 
-	/* HugeGPT */
-	if (hgpt_page_free(page))
-		return;
-
 	if (put_page_testzero(page))
 		free_the_page(page, order);
 	else if (!head)
@@ -5774,10 +5770,6 @@ EXPORT_SYMBOL(page_frag_alloc_align);
 void page_frag_free(void *addr)
 {
 	struct page *page = virt_to_head_page(addr);
-
-	/* HugeGPT */
-	if (hgpt_page_free(page))
-		return;
 
 	if (unlikely(put_page_testzero(page)))
 		free_the_page(page, compound_order(page));
@@ -9707,10 +9699,6 @@ bool put_page_back_buddy(struct page *page)
 	unsigned long flags;
 	int migratetype = get_pfnblock_migratetype(page, pfn);
 	bool ret = false;
-
-	/* HugeGPT */
-	if (hgpt_page_free(page))
-		return true;
 
 	spin_lock_irqsave(&zone->lock, flags);
 	if (put_page_testzero(page)) {
