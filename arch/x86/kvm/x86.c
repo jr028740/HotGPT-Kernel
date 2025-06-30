@@ -9804,6 +9804,95 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
 		vcpu->arch.complete_userspace_io = complete_hypercall_exit;
 		return 0;
 	}
+#define SHM_SIZE (128 << 20)
+// First half for demote, second half for promote
+#define MAX_ELEM_AMOUNT ((SHM_SIZE / sizeof(unsigned long) - 2) >> 2)
+#define DEMOTE_START 2
+#define PROMOTE_START (2 + MAX_ELEM_AMOUNT - 1)
+
+//	#define MADV_HUGEPAGE	14		/* Worth backing with hugepages */
+#define MADV_COLLAPSE	25		/* Synchronous hugepage collapse */
+	case KVM_HC_TLBH_HOST_ALIGN: {
+		// u64 ivshmem_idx = a0;
+		struct file *ivshmem_file = NULL;
+		unsigned long read_buf[2];
+		unsigned long hva;
+		int kernel_read_ret;
+		unsigned long i;
+		loff_t pos;
+
+		ivshmem_file = filp_open("/dev/shm/tlbh0", O_RDWR, 0644);
+		if (!ivshmem_file) {
+			pr_warn("tlbh_host: Opening shared memory file returns %ld.\n",
+					PTR_ERR(ivshmem_file));
+			ret = 0;
+			break;
+		}
+		kernel_read_ret = kernel_read(ivshmem_file, read_buf,
+				2 * sizeof(unsigned long), NULL);
+
+		if (kernel_read_ret < 0) {
+			pr_warn("tlbh_host: Failed to read from shmem file.\n");
+			read_buf[0] = 0UL;
+			read_buf[1] = 0UL;
+		}
+
+		if (read_buf[0] > 0UL) { // Have something to demote
+			pos = DEMOTE_START * sizeof(unsigned long);
+			kernel_read_ret = kernel_read(ivshmem_file, demote_gfns,
+					read_buf[0] * sizeof(unsigned long),
+					&pos);
+			if (kernel_read_ret != read_buf[0] * sizeof(unsigned long))
+				read_buf[0] = kernel_read_ret / sizeof(unsigned long);
+			pr_warn("Kernel readed %lu gfns to demote. First hva: %lx, Last hva: %lx\n",
+					read_buf[0],
+					kvm_vcpu_gfn_to_hva(vcpu, demote_gfns[0]),
+					kvm_vcpu_gfn_to_hva(vcpu, demote_gfns[read_buf[0]]));
+		}
+
+		if (read_buf[1] > 0UL) { // Have something to promote
+			pos = PROMOTE_START * sizeof(unsigned long);
+			kernel_read_ret = kernel_read(ivshmem_file, promote_gfns,
+					read_buf[1] * sizeof(unsigned long),
+					&pos);
+			if (kernel_read_ret != read_buf[1] * sizeof(unsigned long))
+				read_buf[1] = kernel_read_ret / sizeof(unsigned long);
+			pr_warn("Kernel readed %lu gfns to promote. First hva: %lx, Last hva: %lx\n",
+					read_buf[1],
+					kvm_vcpu_gfn_to_hva(vcpu, promote_gfns[0]),
+					kvm_vcpu_gfn_to_hva(vcpu, promote_gfns[read_buf[1]]));
+		}
+
+		filp_close(ivshmem_file, NULL);
+		if (read_buf[0] > 0UL) { // Have something to demote
+			for (i = 0UL; i < read_buf[0]; ++i) {
+				hva = kvm_vcpu_gfn_to_hva(vcpu, demote_gfns[i]);
+				hva = ALIGN_DOWN(hva, HPAGE_PMD_SIZE);
+				if (hva > 0UL) {
+					tlbh_demote_memory_region(vcpu->kvm->mm,
+							hva, hva + HPAGE_PMD_SIZE);
+				}
+			}
+		}
+
+		if (read_buf[1] > 0UL) { // Have something to promote
+			for (i = 0UL; i < read_buf[1]; ++i) {
+				hva = kvm_vcpu_gfn_to_hva(vcpu, promote_gfns[i]);
+				hva = ALIGN_DOWN(hva, HPAGE_PMD_SIZE);
+				if (hva > 0UL) {
+					//	do_madvise(vcpu->kvm->mm,
+					//			hva, hva + HPAGE_PMD_SIZE,
+					//			MADV_HUGEPAGE);
+					do_madvise(vcpu->kvm->mm,
+							hva, HPAGE_PMD_SIZE,
+							MADV_COLLAPSE);
+				}
+			}
+		}
+
+		ret = 0;
+		break;
+	}
 	default:
 		ret = -KVM_ENOSYS;
 		break;

@@ -792,7 +792,9 @@ static int tlbh_write_gfns(pmd_t *pmd, unsigned long addr,
 			pte_unmap_unlock(pte, ptl);
 			return 0;
 		}
-		pfn = pte_pfn(*pte);
+		// pfn = pte_pfn(*pte);
+		// Get the pfn of the pte page (ZS)
+		pfn = (virt_to_phys(pte) >> PAGE_SHIFT);
 		if (likely(pfn)) {
 			buffer_base[buffer_idx] = pfn;
 			++(*addr_num);
@@ -926,8 +928,11 @@ static void tlbh_write_gfns_range(struct mm_struct *mm,
 //		return (uintptr_t) pte_page;
 //	}
 
-#ifdef CONFIG_X86
-#include <asm/pgalloc.h>
+//	No need to collapse guest's page table pages in guest
+//	address space (ZS)
+
+//	#ifdef CONFIG_X86
+//	#include <asm/pgalloc.h>
 
 //	static inline void paravirt_alloc_pte(struct mm_struct *mm, unsigned long pfn) {
 //		PVOP_VCALL2((paravirt_ops.mmu).alloc_pte, mm, pfn);
@@ -939,80 +944,109 @@ static void tlbh_write_gfns_range(struct mm_struct *mm,
 //		set_pmd(pmd, __pmd(__pa(pte) | _PAGE_TABLE));
 //	}
 
-static int collapse_pte_pages(struct mm_struct *mm, unsigned long start_addr) {
-	struct page *huge_page;
-	pmd_t *pmd;
-	pgtable_t new_pt;
-	int i;
-	unsigned long addr = start_addr;
-	
-	// Allocate a 2MB hugepage for merging
-	huge_page = alloc_pages(GFP_KERNEL | __GFP_COMP, get_order(PMD_SIZE));
-	if (!huge_page)
-		return -ENOMEM;
-	
-	// Lock page table
-	down_write(&mm->mmap_lock);
-	
-	for (i = 0; i < 512; i++, addr += PAGE_SIZE) {
-		struct vm_area_struct *flush_vma = find_vma(mm, addr);
+//	static int collapse_pte_pages(struct mm_struct *mm, unsigned long start_addr,
+//			unsigned long end_addr) {
+//		struct page *huge_page;
+//		pmd_t *pmd_now = NULL, *pmd_prev = NULL;
+//		pte_t *prev_pte = NULL;
+//		// pgtable_t new_pt;
+//		int i = 0;
+//		unsigned long addr = start_addr;
+//		
+//		// Allocate a 2MB hugepage for merging
+//		huge_page = alloc_pages(GFP_KERNEL | __GFP_COMP | __GFP_ZERO,
+//				HPAGE_PMD_ORDER);
+//		if (!huge_page)
+//			return -ENOMEM;
+//		
+//		// Lock page table
+//		down_write(&mm->mmap_lock);
+//		
+//		for (; start_addr < end_addr; addr += HPAGE_PMD_SIZE) {
+//			struct vm_area_struct *flush_vma = find_vma(mm, addr);
+//			if (!flush_vma)
+//				continue;
+//	
+//			pmd_now = pmd_offset(pud_offset(p4d_offset(pgd_offset(mm, addr), addr), addr), addr);
+//	
+//			if (pmd_now == pmd_prev)
+//				continue;
+//			
+//			if (pmd_none(*pmd_now) || !pmd_present(*pmd_now)
+//					|| pmd_trans_huge(*pmd_now)) {
+//				// skip invalid entries
+//				continue;
+//			}
+//			
+//			pte_t *old_pte = pte_offset_kernel(pmd_now, addr);
+//			pte_t *old_pte_base = (pte_t *)((unsigned long)old_pte & PAGE_MASK);
+//			if (prev_pte == old_pte_base)
+//				continue;
+//			struct page *old_pte_page = virt_to_page(old_pte_base);
+//			
+//			// Offset into huge page
+//			void *dst = page_address(huge_page) + (i * PAGE_SIZE);
+//			void *src = (void *)old_pte_base;
+//			
+//			// Copy page table content
+//			memcpy(dst, src, PAGE_SIZE);
+//			
+//			pmd_clear(pmd_now);
+//	
+//			struct page *pte_pg = virt_to_page(old_pte_base);
+//			pr_warn("Freeing PTE page at %px (struct page: %p, mapcount: %d)\n",
+//					        old_pte_base, pte_pg, page_mapcount(pte_pg));
+//	
+//			pte_free_kernel(mm, old_pte_base);
+//			// Replace PTE page pointer with new one
+//			// new_pt = virt_to_page(dst); // convert back to struct page*
+//			pmd_populate_kernel(mm, pmd_now, (pte_t *)dst);
+//			
+//			// Flush TLB to avoid stale entries
+//			flush_tlb_page(flush_vma, addr);
+//	
+//			// Free up the old base page table pages
+//			if (page_mapcount(old_pte_page) > -1) {
+//				pr_warn("Old PTE page at 0x%lx still mapped\n", addr);
+//			}
+//	
+//			if (i >= 511)
+//				i = 0;
+//			else
+//				++i;
+//	
+//			pmd_prev = pmd_now;
+//			prev_pte = old_pte_base;
+//		}
+//		
+//		up_write(&mm->mmap_lock);
+//		return 0;
+//	}
 
-		pmd = pmd_offset(pud_offset(p4d_offset(pgd_offset(mm, addr), addr), addr), addr);
-		
-		if (pmd_none(*pmd) || !pmd_present(*pmd)) {
-			// skip invalid entries
-			continue;
-		}
-		
-		pte_t *old_pte;
-		old_pte = pte_offset_kernel(pmd, addr);
-		
-		// Offset into huge page
-		void *dst = page_address(huge_page) + (i * PAGE_SIZE);
-		void *src = (void *)old_pte;
-		
-		// Copy page table content
-		memcpy(dst, src, PAGE_SIZE);
-		
-		// Replace PTE page pointer with new one
-		new_pt = virt_to_page(dst); // convert back to struct page*
-		pmd_populate_kernel(mm, pmd, (pte_t *)dst);
-		
-		// Flush TLB to avoid stale entries
-		if (flush_vma)
-			flush_tlb_page(flush_vma, addr);
-	}
-	
-	up_write(&mm->mmap_lock);
-	return 0;
-}
-
-#else
-
-static inline int collapse_pte_pages(struct mm_struct *mm, unsigned long start_addr) {}
-
-#endif
-
-// Print page table page address of a range [start,end) (ZS)
-static void hotgpt_promote_pgtable_page(struct mm_struct *mm,
-		unsigned long start, unsigned long end)
-{
-	unsigned long i;
-	//	uintptr_t prev_addr = 0;
-	//	uintptr_t now_addr = 0;
-
-	for (i = start; i < end; i += HPAGE_PMD_SHIFT) {
-		//	now_addr = find_page_table_page(mm, i);
-		//	if (prev_addr != now_addr && now_addr != 0) {
-		//		// do_madvise();	
-		//		prev_addr = now_addr;
-		//		pr_warn("PTE page: %lx\n", now_addr);
-		//	}
-		collapse_pte_pages(mm, i);	
-
-	}
-
-}
+//	static int collapse_pte_pages(struct mm_struct *mm, unsigned long start_addr,
+//			unsigned long end_addr) {
+//	
+//		return 0;
+//	}
+//	
+//	#else
+//	
+//	static inline int collapse_pte_pages(struct mm_struct *mm, unsigned long start_addr,
+//			unsigned long end_addr) {}
+//	
+//	#endif
+//	
+//	// Print page table page address of a range [start,end) (ZS)
+//	static void hotgpt_promote_pgtable_page(struct mm_struct *mm,
+//			unsigned long start, unsigned long end)
+//	{
+//		//	unsigned long i;
+//		//	uintptr_t prev_addr = 0;
+//		//	uintptr_t now_addr = 0;
+//	
+//		collapse_pte_pages(mm, start, end);
+//	
+//	}
 
 #ifndef CONFIG_ADVISE_SYSCALLS
 static unsigned long damos_madvise(struct damon_target *target,
@@ -1390,7 +1424,7 @@ static void do_hugepage_reallocate(struct damon_ctx *ctx, struct damon_target *t
 				// Get the page table address of the region (ZS)
 
 				//	do_madvise(mm, pmd_aligned_start, pmd_aligned_len, MADV_COLLAPSE);
-				hotgpt_promote_pgtable_page(mm, pmd_aligned_start, pmd_aligned_start + pmd_aligned_len);
+				//	hotgpt_promote_pgtable_page(mm, pmd_aligned_start, pmd_aligned_start + pmd_aligned_len);
 				// Write the gfns to shared memory (promote)
 				if (t->tlbh_ivshmem_base) {
 					tlbh_write_gfns_range(mm, pmd_aligned_start,
@@ -1424,7 +1458,7 @@ static void do_hugepage_reallocate(struct damon_ctx *ctx, struct damon_target *t
 
 	if (t->tlbh_ivshmem_base) {
                 memunmap(t->tlbh_ivshmem_base);
-                //	kvm_hypercall1(KVM_HC_TLBH_HOST_ALIGN, 1);
+               	kvm_hypercall1(KVM_HC_TLBH_HOST_ALIGN, 1);
         }
 
 	//	pr_warn("reallocated charged_sz: %lu\n", quota->charged_sz);
