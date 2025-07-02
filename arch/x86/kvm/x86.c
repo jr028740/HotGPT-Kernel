@@ -311,6 +311,10 @@ u64 __read_mostly host_xcr0;
 
 static struct kmem_cache *x86_emulator_cache;
 
+// For doing host demotion and promotion (ZS)
+unsigned long demote_gfns[20480];
+unsigned long promote_gfns[10240];
+
 /*
  * When called, it means the previous get/set msr reached an invalid msr.
  * Return true if we want to ignore/silent this failed msr access.
@@ -9821,7 +9825,7 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
 		unsigned long i;
 		loff_t pos;
 
-		ivshmem_file = filp_open("/dev/shm/tlbh0", O_RDWR, 0644);
+		ivshmem_file = filp_open("/dev/shm/tlbh1", O_RDWR, 0644);
 		if (!ivshmem_file) {
 			pr_warn("tlbh_host: Opening shared memory file returns %ld.\n",
 					PTR_ERR(ivshmem_file));

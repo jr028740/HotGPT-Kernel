@@ -47,6 +47,9 @@
 #define CREATE_TRACE_POINTS
 #include <trace/events/thp.h>
 
+// For using mm_walk (ZS)Add commentMore actions
+#include <linux/pagewalk.h>
+
 /*
  * By default, transparent hugepage support is disabled in order to avoid
  * risking an increased memory footprint for applications that are not
@@ -3304,3 +3307,70 @@ void remove_migration_pmd(struct page_vma_mapped_walk *pvmw, struct page *new)
 	trace_remove_migration_pmd(address, pmd_val(pmde));
 }
 #endif
+
+// Demote all THPs within the range [start, end) using mm_walk (ZS)
+static int tlbh_demote_huge_pmd(pmd_t *pmd, unsigned long addr,
+		unsigned long next, struct mm_walk *walk) {
+	
+	struct page *page = NULL;
+	unsigned long *err_cnt = walk->private;
+
+	if (pmd_trans_huge(*pmd)) {
+		pmd_t demote_pmd;
+		spinlock_t *ptl = pmd_trans_huge_lock(pmd, walk->vma);
+		if (!ptl) {
+			++err_cnt;
+			return 0;
+		}
+
+		demote_pmd = *pmd;
+
+		if (unlikely(!pmd_present(demote_pmd))) {
+			VM_BUG_ON(thp_migration_supported() &&
+					!is_pmd_migration_entry(demote_pmd));
+			goto err_pmd_unlock;
+		}
+
+		page = pmd_page(demote_pmd);
+
+		// Do not demote non-anonymous huge pages
+		if (!PageAnon(page)) {
+			goto err_pmd_unlock;
+		}
+
+		get_page(page);
+		spin_unlock(ptl);
+		lock_page(page);
+		if (unlikely(split_huge_page(page))) {
+			++err_cnt;
+		}
+		unlock_page(page);
+		put_page(page);
+		return 0;
+
+err_pmd_unlock:
+		spin_unlock(ptl);
+		++err_cnt;
+	}
+
+	return 0;
+}
+
+static const struct mm_walk_ops tlbh_demote_region_ops = {
+	.pmd_entry = tlbh_demote_huge_pmd,
+};
+
+unsigned long tlbh_demote_memory_region(struct mm_struct *mm,
+		unsigned long start, unsigned long end)
+{
+	unsigned long err_cnt = 0;
+
+	//	do_madvise(mm, start, end - start, MADV_NOHUGEPAGE);
+
+	mmap_read_lock(mm);	
+	walk_page_range(mm, start, end, &tlbh_demote_region_ops, &err_cnt);
+	mmap_read_unlock(mm);
+
+	return err_cnt;
+}
+EXPORT_SYMBOL_GPL(tlbh_demote_memory_region);
