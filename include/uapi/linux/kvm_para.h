@@ -32,6 +32,7 @@
 #define KVM_HC_MAP_GPA_RANGE		12
 // Hypercall to host for alignment (ZS)
 #define KVM_HC_TLBH_HOST_ALIGN		13
+#define KVM_HC_TLBH_DEMOTE_ALL		14
 
 /*
  * hypercalls use architecture specific

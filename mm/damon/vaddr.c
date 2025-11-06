@@ -787,6 +787,19 @@ static int tlbh_write_gfns(pmd_t *pmd, unsigned long addr,
 	if (likely(addr_num &&
 		((*addr_num) <= MAX_ELEM_AMOUNT))) {
 
+		// Also write the pmds
+		ptl = pmd_lock(walk->mm, pmd);
+		if (!pmd_present(*pmd)) {
+			spin_unlock(ptl);
+			return 0;
+		}
+		pfn = (virt_to_phys(pmd) >> PAGE_SHIFT);
+		if (likely(pfn)) {
+			buffer_base[buffer_idx] = pfn;
+			++(*addr_num);
+		}
+		spin_unlock(ptl);
+
 		pte = pte_offset_map_lock(walk->mm, pmd, addr, &ptl);
 		if (!pte_present(*pte)) {
 			pte_unmap_unlock(pte, ptl);

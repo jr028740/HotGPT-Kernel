@@ -465,4 +465,7 @@ static inline bool arch_thp_swp_supported(void)
 unsigned long tlbh_demote_memory_region(struct mm_struct *mm,
 		unsigned long start, unsigned long end);
 
+// Demote all THPs of a given mm using mm_walk (ZS)
+unsigned long tlbh_demote_mm_all(struct mm_struct *mm);
+
 #endif /* _LINUX_HUGE_MM_H */

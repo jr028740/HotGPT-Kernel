@@ -312,8 +312,8 @@ u64 __read_mostly host_xcr0;
 static struct kmem_cache *x86_emulator_cache;
 
 // For doing host demotion and promotion (ZS)
-unsigned long demote_gfns[20480];
-unsigned long promote_gfns[10240];
+unsigned long demote_gfns[40960];
+unsigned long promote_gfns[40960];
 
 /*
  * When called, it means the previous get/set msr reached an invalid msr.
@@ -9841,18 +9841,18 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
 			read_buf[1] = 0UL;
 		}
 
-		if (read_buf[0] > 0UL) { // Have something to demote
-			pos = DEMOTE_START * sizeof(unsigned long);
-			kernel_read_ret = kernel_read(ivshmem_file, demote_gfns,
-					read_buf[0] * sizeof(unsigned long),
-					&pos);
-			if (kernel_read_ret != read_buf[0] * sizeof(unsigned long))
-				read_buf[0] = kernel_read_ret / sizeof(unsigned long);
-			pr_warn("Kernel readed %lu gfns to demote. First hva: %lx, Last hva: %lx\n",
-					read_buf[0],
-					kvm_vcpu_gfn_to_hva(vcpu, demote_gfns[0]),
-					kvm_vcpu_gfn_to_hva(vcpu, demote_gfns[read_buf[0]]));
-		}
+		//	if (read_buf[0] > 0UL) { // Have something to demote
+		//		pos = DEMOTE_START * sizeof(unsigned long);
+		//		kernel_read_ret = kernel_read(ivshmem_file, demote_gfns,
+		//				read_buf[0] * sizeof(unsigned long),
+		//				&pos);
+		//		if (kernel_read_ret != read_buf[0] * sizeof(unsigned long))
+		//			read_buf[0] = kernel_read_ret / sizeof(unsigned long);
+		//		pr_warn("Kernel readed %lu gfns to demote. First hva: %lx, Last hva: %lx\n",
+		//				read_buf[0],
+		//				kvm_vcpu_gfn_to_hva(vcpu, demote_gfns[0]),
+		//				kvm_vcpu_gfn_to_hva(vcpu, demote_gfns[read_buf[0]]));
+		//	}
 
 		if (read_buf[1] > 0UL) { // Have something to promote
 			pos = PROMOTE_START * sizeof(unsigned long);
@@ -9868,16 +9868,16 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
 		}
 
 		filp_close(ivshmem_file, NULL);
-		if (read_buf[0] > 0UL) { // Have something to demote
-			for (i = 0UL; i < read_buf[0]; ++i) {
-				hva = kvm_vcpu_gfn_to_hva(vcpu, demote_gfns[i]);
-				hva = ALIGN_DOWN(hva, HPAGE_PMD_SIZE);
-				if (hva > 0UL) {
-					tlbh_demote_memory_region(vcpu->kvm->mm,
-							hva, hva + HPAGE_PMD_SIZE);
-				}
-			}
-		}
+		//	if (read_buf[0] > 0UL) { // Have something to demote
+		//		for (i = 0UL; i < read_buf[0]; ++i) {
+		//			hva = kvm_vcpu_gfn_to_hva(vcpu, demote_gfns[i]);
+		//			hva = ALIGN_DOWN(hva, HPAGE_PMD_SIZE);
+		//			if (hva > 0UL) {
+		//				tlbh_demote_memory_region(vcpu->kvm->mm,
+		//						hva, hva + HPAGE_PMD_SIZE);
+		//			}
+		//		}
+		//	}
 
 		if (read_buf[1] > 0UL) { // Have something to promote
 			for (i = 0UL; i < read_buf[1]; ++i) {
@@ -9897,6 +9897,11 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
 		ret = 0;
 		break;
 	}
+	case KVM_HC_TLBH_DEMOTE_ALL: {
+                tlbh_demote_mm_all(vcpu->kvm->mm);
+                ret = 0;
+                break;
+        }
 	default:
 		ret = -KVM_ENOSYS;
 		break;

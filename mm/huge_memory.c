@@ -50,6 +50,10 @@
 // For using mm_walk (ZS)Add commentMore actions
 #include <linux/pagewalk.h>
 
+// For using thp limit (ZS)
+#include <linux/vmstat.h>
+#include <linux/mmzone.h>
+
 /*
  * By default, transparent hugepage support is disabled in order to avoid
  * risking an increased memory footprint for applications that are not
@@ -80,6 +84,13 @@ bool hugepage_vma_check(struct vm_area_struct *vma, unsigned long vm_flags,
 {
 	if (!vma->vm_mm)		/* vdso */
 		return false;
+
+	//	// Stop having more THPs if the limit has reached (ZS)
+        //	if (global_node_page_state_pages(NR_ANON_THPS) >= MM_THP_LIMIT) {
+        //	        pr_warn_once("mm_thp_count: %lu reaches limit of %lu\n",
+        //	                        global_node_page_state_pages(NR_ANON_THPS), MM_THP_LIMIT);
+        //	        return false;
+        //	}
 
 	/*
 	 * Explicitly disabled through madvise or prctl, or some
@@ -3374,3 +3385,18 @@ unsigned long tlbh_demote_memory_region(struct mm_struct *mm,
 	return err_cnt;
 }
 EXPORT_SYMBOL_GPL(tlbh_demote_memory_region);
+
+unsigned long tlbh_demote_mm_all(struct mm_struct *mm) {
+        struct vm_area_struct *vma;
+        unsigned long ret = 0UL;
+        VMA_ITERATOR(vmi, mm, 0);
+
+        mmap_read_lock(mm);
+        for_each_vma(vmi, vma) {
+                ret += tlbh_demote_memory_region(mm, vma->vm_start, vma->vm_end);
+        }
+
+        mmap_read_unlock(mm);
+        return ret;
+}
+EXPORT_SYMBOL_GPL(tlbh_demote_mm_all);

@@ -30,6 +30,17 @@
 #include <linux/kasan.h>
 #include <linux/memremap.h>
 
+// Define size limit of thps as 100MB
+// (ZS)
+//      #ifndef MM_THP_MAXSIZE
+//      #define MM_THP_MAXSIZE  4UL
+//      #endif
+
+#ifndef MM_THP_LIMIT
+//      #define MM_THP_LIMIT (MM_THP_MAXSIZE << 18)
+#define MM_THP_LIMIT 25600UL
+#endif
+
 struct mempolicy;
 struct anon_vma;
 struct anon_vma_chain;
