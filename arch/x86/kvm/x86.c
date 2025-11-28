@@ -312,8 +312,12 @@ u64 __read_mostly host_xcr0;
 static struct kmem_cache *x86_emulator_cache;
 
 // For doing host demotion and promotion (ZS)
-unsigned long demote_gfns[40960];
-unsigned long promote_gfns[40960];
+unsigned long demote_gfns[81920];
+unsigned long promote_gfns[81920];
+
+// For storing already promoted huge hvas
+unsigned long promoted_huge_hvas[10240];
+unsigned int nr_promoted_huge_hvas = 0;
 
 /*
  * When called, it means the previous get/set msr reached an invalid msr.
@@ -9825,6 +9829,8 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
 		unsigned long i;
 		loff_t pos;
 
+		unsigned int j;
+
 		ivshmem_file = filp_open("/dev/shm/tlbh1", O_RDWR, 0644);
 		if (!ivshmem_file) {
 			pr_warn("tlbh_host: Opening shared memory file returns %ld.\n",
@@ -9881,18 +9887,38 @@ int kvm_emulate_hypercall(struct kvm_vcpu *vcpu)
 
 		if (read_buf[1] > 0UL) { // Have something to promote
 			for (i = 0UL; i < read_buf[1]; ++i) {
+
+				bool hva_promoted = false;
 				hva = kvm_vcpu_gfn_to_hva(vcpu, promote_gfns[i]);
+
 				hva = ALIGN_DOWN(hva, HPAGE_PMD_SIZE);
 				if (hva > 0UL) {
 					//	do_madvise(vcpu->kvm->mm,
 					//			hva, hva + HPAGE_PMD_SIZE,
 					//			MADV_HUGEPAGE);
+					for (j = 0; j < nr_promoted_huge_hvas; ++j) {
+						if (promoted_huge_hvas[j] == hva) {
+							hva_promoted = true;
+							break;
+						}
+					}
+					if (hva_promoted)
+						continue;
+
+					if (nr_promoted_huge_hvas < 10240) {
+						promoted_huge_hvas[nr_promoted_huge_hvas] =
+							hva;
+						++nr_promoted_huge_hvas;
+					}
+
 					do_madvise(vcpu->kvm->mm,
 							hva, HPAGE_PMD_SIZE,
 							MADV_COLLAPSE);
 				}
 			}
 		}
+
+		nr_promoted_huge_hvas = 0;
 
 		ret = 0;
 		break;
